@@ -1,0 +1,16 @@
+CrashLogger v0.2 source package status
+=====================================
+
+This package contains the v0.2 source changes and intentionally does NOT include
+the uploaded archive's old build/CrashLogger.asi binary.
+
+Validation performed in this environment:
+- source/header brace-balance sanity check
+- local quoted-include resolution check
+- CMake source-list coverage check
+- source diff reviewed against the uploaded v0.1 tree
+
+A Windows ASI rebuild was not possible in this sandbox because the project's
+MSVC-Wine toolchain points at /mnt/sata/msvc/bin/x64 and that toolchain/Windows SDK
+is not installed here. Build on the project's configured MSVC-Wine environment
+before deploying the v0.2 ASI into the game.

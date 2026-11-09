@@ -1,0 +1,58 @@
+# Prerequisites & Build Output
+build/
+bin/
+out/
+cmake-build-*/
+.cache/
+
+# CMake temporary files
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+ninja.log
+.ninja_deps
+.ninja_log
+
+# Compiled object / binary files (excluding released artifacts in dist/)
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Release packaging
+dist/
+*.zip
+*.tar.gz
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.vs/
+*.suo
+*.user
+*.userosv
+*.sln.docstates
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Runtime log & dump files
+*.log
+*.dmp
+*.active

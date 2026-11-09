@@ -1,0 +1,1297 @@
+diff --git a/b/BUILD_STATUS.txt b/BUILD_STATUS.txt
+new file mode 100644
+index 0000000..e1bdc67
+--- /dev/null
++++ b/BUILD_STATUS.txt
+@@ -0,0 +1,16 @@
++CrashLogger v0.2 source package status
++=====================================
++
++This package contains the v0.2 source changes and intentionally does NOT include
++the uploaded archive's old build/CrashLogger.asi binary.
++
++Validation performed in this environment:
++- source/header brace-balance sanity check
++- local quoted-include resolution check
++- CMake source-list coverage check
++- source diff reviewed against the uploaded v0.1 tree
++
++A Windows ASI rebuild was not possible in this sandbox because the project's
++MSVC-Wine toolchain points at /mnt/sata/msvc/bin/x64 and that toolchain/Windows SDK
++is not installed here. Build on the project's configured MSVC-Wine environment
++before deploying the v0.2 ASI into the game.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index acdfb49..220b2b7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ cmake_minimum_required(VERSION 3.21)
+-project(CrashLogger VERSION 0.1.0 LANGUAGES CXX)
++project(CrashLogger VERSION 0.2.0 LANGUAGES CXX)
+ 
+ # Built as an ASI: Ultimate ASI Loader (bin/x64/version.dll) loads *.asi from
+ # bin/x64/plugins/ very early — before RED4ext and before cyber_engine_tweaks.asi.
+@@ -19,9 +19,12 @@ add_library(CrashLogger SHARED
+     src/Main.cpp
+     src/Modules.cpp
+     src/RTTIReader.cpp
++    src/ResourceMonitor.cpp
++    src/SessionRecovery.cpp
+     src/StackWalker.cpp
+     src/SystemInfo.cpp
+     src/ThreadInfo.cpp
++    src/ThreadSnapshot.cpp
+ )
+ 
+ target_include_directories(CrashLogger PRIVATE include)
+diff --git a/README.md b/README.md
+index e25615c..85ca4d3 100644
+--- a/README.md
++++ b/README.md
+@@ -152,6 +152,8 @@ new `Annotate()` to symbolicate.
+ | `CrashLogger_trace.log` | rolling breadcrumb trace: first-chance exceptions and lifecycle markers, written as they happen. Raw `WriteFile` on an allocation-free path, so it survives a corrupted heap and `TerminateProcess` — often the only survivor |
+ | `crash_<timestamp>.log` | full crash report |
+ | `hang_<timestamp>.log` | freeze report — verdict, 3 main-thread stack samples, attribution |
++| `postmortem_<timestamp>_pid<pid>.log` | next-launch recovery for an unclean previous session; correlates native REDengine crash artifacts when available |
++| `sessions/<pid>.active` | tiny current-session marker; removed on clean shutdown |
+ | `crash_<timestamp>.dmp` | minidump |
+ 
+ Verified end to end under wine 11.7 with a deliberate null+0x38 write: symbolized
+@@ -165,5 +167,19 @@ module list and breadcrumbs all produced correctly.
+   `SYSTEM` may read "captured at plugin load — this crash preceded it". The mod
+   inventory is captured immediately rather than after the IAT rescan precisely because
+   this game's crashes cluster at save-load and world-attach.
+-- A raw `__fastfail` / `int 29h` still cannot be caught in-process; for those the
+-  Wine log via `PROTON_LOG=1` remains the source of truth.
++- A raw `__fastfail` / `int 29h` still cannot be intercepted reliably in-process.
++  v0.2 can now detect the resulting unclean session on the next launch and correlate
++  REDengine ReportQueue artifacts, but the Wine log via `PROTON_LOG=1` remains an
++  important source for the actual low-level termination path.
++
++## v0.2 — additional crash detection
++
++This revision adds several paths that the original in-process exception handler could not diagnose well:
++
++- **Previous-session postmortem recovery.** Every run owns `CrashLogger/sessions/<pid>.active`. A clean exit removes it. If it survives, the next launch creates `postmortem_<timestamp>_pid<pid>.log` and correlates the dead session with the newest `%LOCALAPPDATA%\REDEngine\ReportQueue` folder, embedding `stacktrace.txt` and `CrashInfo.json` when present. This gives evidence for raw fail-fast, driver/process kills and crashes that die before the rich writer finishes.
++- **Resource pressure watchdog.** Every five seconds it records system commit, available physical RAM, process private/working-set memory, handle count and free log-volume space. Threshold crossings are flushed to `CrashLogger_trace.log`; crash and hang reports contain last/peak/minimum values.
++- **All-thread snapshots.** Crash reports now unwind up to 48 non-crashing threads (24 frames each). Hang reports capture up to 32 other threads (16 frames each). Threads with a RED4ext/ASI/loader DLL on their stack are marked, which makes cross-thread deadlocks and worker failures much easier to identify.
++- **More fatal runtime paths.** IAT hooks now also catch imported `abort()` and `_purecall()`, and a non-zero `ExitProcess`. The VEH guard recognizes heap corruption (`0xC0000374`), stack-buffer/fail-fast (`0xC0000409`), no-memory (`0xC0000017`), insufficient-resources (`0xC000009A`) and fatal-user-callback (`0xC000041D`) failures.
++- **Crash-class hints.** Reports label resource exhaustion, heap corruption, stack exhaustion, runtime abort, pure virtual calls, `std::terminate`, self-termination and non-zero process exit so the raw exception code does not need to be decoded manually.
++
++The previous-session recovery intentionally treats a surviving marker as **abnormal termination**, not proof of a specific root cause. The correlated REDengine artifacts, trace breadcrumbs, resource history and stacks are the evidence used to narrow the cause.
+diff --git a/b/include/ResourceMonitor.h b/include/ResourceMonitor.h
+new file mode 100644
+index 0000000..b26708c
+--- /dev/null
++++ b/include/ResourceMonitor.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++// -----------------------------------------------------------------------------
++// ResourceMonitor — records resource pressure *before* a crash.
++//
++// Sampling memory only after an allocation failure can be too late: the system may
++// already have reclaimed memory or the rich crash writer itself may be unable to
++// allocate.  A tiny watchdog therefore keeps atomics with the last/peak/minimum
++// values and emits durable breadcrumbs when commit, RAM, handles or disk space
++// enter dangerous territory.
++// -----------------------------------------------------------------------------
++
++namespace ResourceMonitor
++{
++    void Start();
++
++    // Pre-render the latest/peak resource state from atomic samples.  No filesystem
++    // access and no process enumeration happens here; suitable for crash reports.
++    std::string Report();
++}
+diff --git a/b/include/SessionRecovery.h b/include/SessionRecovery.h
+new file mode 100644
+index 0000000..891e9a4
+--- /dev/null
++++ b/include/SessionRecovery.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++// -----------------------------------------------------------------------------
++// SessionRecovery — next-launch evidence for crashes that cannot be caught in the
++// dying process (raw __fastfail/int 29h, driver reset, SIGKILL, Wine termination,
++// power loss, or a crash before the rich writer completes).
++//
++// Each run owns a tiny <pid>.active marker. Clean shutdown removes it. On the next
++// run, stale markers are correlated with CDPR's native
++// %LOCALAPPDATA%\REDEngine\ReportQueue and a self-contained postmortem is made.
++// -----------------------------------------------------------------------------
++
++namespace SessionRecovery
++{
++    // Analyze stale markers from previous runs and arm the marker for this run.
++    // Deferred-init thread only; performs filesystem I/O.
++    void Init();
++
++    // Allocation-free state bit set as soon as CrashHandler commits to a crash.
++    void MarkAbnormal() noexcept;
++
++    // Called from known clean process-exit hooks. Best-effort.
++    void MarkCleanExit() noexcept;
++
++    // Loader-lock-safe shutdown fallback. DLL_PROCESS_DETACH is also reached when
++    // WinMain simply returns, a path that need not import ExitProcess at all.
++    // The marker is removed only when MarkAbnormal() was never set.
++    void OnProcessDetach() noexcept;
++}
+diff --git a/b/include/ThreadSnapshot.h b/include/ThreadSnapshot.h
+new file mode 100644
+index 0000000..0d80212
+--- /dev/null
++++ b/include/ThreadSnapshot.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include "StackWalker.h"
++
++// -----------------------------------------------------------------------------
++// ThreadSnapshot — raw unwind snapshots of the *other* threads in the process.
++//
++// A crashing thread tells us where the fault surfaced, but deadlocks, worker-pool
++// failures and cross-thread lifetime bugs often leave the useful evidence on a
++// different thread.  The capture path suspends one thread at a time only long
++// enough to copy CONTEXT + unwind addresses, resumes it immediately, and performs
++// every allocation afterwards.  That avoids the classic reporter deadlock where a
++// suspended victim owns the CRT heap or dbghelp lock.
++// -----------------------------------------------------------------------------
++
++struct ThreadStackSnapshot
++{
++    std::uint32_t              threadId{};
++    std::string                description;
++    std::vector<std::uint64_t> addresses;
++};
++
++struct ThreadSnapshotResult
++{
++    std::vector<ThreadStackSnapshot> threads;
++    std::size_t                      candidates{};
++    std::size_t                      failed{};
++    bool                             truncated{};
++};
++
++namespace ThreadSnapshot
++{
++    // Capture all process threads except `excludedThreadId` and the caller.  Each
++    // thread is resumed before any vector/string work is performed.
++    ThreadSnapshotResult Capture(std::uint32_t excludedThreadId,
++                                 std::size_t maxThreads = 48,
++                                 std::size_t maxFrames = 24);
++}
+diff --git a/src/Breadcrumbs.cpp b/src/Breadcrumbs.cpp
+index fea2953..4c192bc 100644
+--- a/src/Breadcrumbs.cpp
++++ b/src/Breadcrumbs.cpp
+@@ -58,6 +58,8 @@ namespace Breadcrumbs
+         case EXCEPTION_FLT_DIVIDE_BY_ZERO:       return "FLT_DIVIDE_BY_ZERO";
+         case EXCEPTION_STACK_OVERFLOW:           return "STACK_OVERFLOW";
+         case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "NONCONTINUABLE";
++        case 0xC0000017:                         return "NO_MEMORY";
++        case 0xC000009A:                         return "INSUFFICIENT_RESOURCES";
+         case 0xC0000374:                         return "HEAP_CORRUPTION";
+         case 0xC0000409:                         return "STACK_BUFFER_OVERRUN";  // __fastfail / /GS
+         case 0xC000041D:                         return "FATAL_USER_CALLBACK";
+@@ -81,6 +83,8 @@ namespace Breadcrumbs
+         case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+         case EXCEPTION_STACK_OVERFLOW:
+         case EXCEPTION_NONCONTINUABLE_EXCEPTION:
++        case 0xC0000017:   // no memory
++        case 0xC000009A:   // insufficient resources
+         case 0xC0000374:   // heap corruption
+         case 0xC0000409:   // stack buffer overrun / __fastfail
+         case 0xC000041D:   // fatal user-callback
+diff --git a/src/CrashHandler.cpp b/src/CrashHandler.cpp
+index 610c5d0..a388541 100644
+--- a/src/CrashHandler.cpp
++++ b/src/CrashHandler.cpp
+@@ -5,6 +5,7 @@
+ #include "LogWriter.h"
+ #include "Modules.h"
+ #include "RTTIReader.h"
++#include "SessionRecovery.h"
+ #include "StackWalker.h"
+ 
+ #include <cstdlib>
+@@ -51,13 +52,25 @@ namespace CrashHandler
+     using TerminateProcess_t            = BOOL (WINAPI*)(HANDLE, UINT);
+     using ExitProcess_t                 = void (WINAPI*)(UINT);
+     using SetUnhandledExceptionFilter_t = LPTOP_LEVEL_EXCEPTION_FILTER (WINAPI*)(LPTOP_LEVEL_EXCEPTION_FILTER);
++    using Abort_t                       = void (__cdecl*)();
++    using Purecall_t                    = int (__cdecl*)();
+ 
+     static RaiseFailFastException_t      s_realRaiseFailFast    = nullptr;
+     static TerminateProcess_t            s_realTerminateProcess = nullptr;
+     static ExitProcess_t                 s_realExitProcess      = nullptr;
+     static SetUnhandledExceptionFilter_t s_realSetFilter        = nullptr;
++    static Abort_t                       s_realAbort             = nullptr;
++    static Purecall_t                    s_realPurecall          = nullptr;
+     static std::terminate_handler        s_prevTerminate        = nullptr;
+ 
++    // Synthetic codes reserved for fatal paths that do not arrive with a useful
++    // Windows exception record. Kept stable so signatures remain comparable.
++    static constexpr DWORD kSyntheticSelfTerminate = 0xE0000001;
++    static constexpr DWORD kSyntheticTerminate     = 0xE0000002;
++    static constexpr DWORD kSyntheticAbort         = 0xE0000003;
++    static constexpr DWORD kSyntheticPurecall      = 0xE0000004;
++    static constexpr DWORD kSyntheticExitNonZero   = 0xE0000005;
++
+     // -------------------------------------------------------------------------
+     // Exception codes that represent genuine, fatal crashes.
+     // -------------------------------------------------------------------------
+@@ -77,6 +90,11 @@ namespace CrashHandler
+         case EXCEPTION_PRIV_INSTRUCTION:
+         case EXCEPTION_STACK_OVERFLOW:
+         case EXCEPTION_NONCONTINUABLE_EXCEPTION:
++        case 0xC0000017: // STATUS_NO_MEMORY
++        case 0xC000009A: // STATUS_INSUFFICIENT_RESOURCES
++        case 0xC0000374: // STATUS_HEAP_CORRUPTION
++        case 0xC0000409: // STATUS_STACK_BUFFER_OVERRUN / fail-fast
++        case 0xC000041D: // STATUS_FATAL_USER_CALLBACK_EXCEPTION
+             return true;
+         default:
+             return false;
+@@ -176,6 +194,7 @@ namespace CrashHandler
+         if (s_handled.exchange(true))
+             return;
+ 
++        SessionRecovery::MarkAbnormal();
+         const CrashContext crash = CrashContext::Capture(ep);
+ 
+         if (offThread) {
+@@ -194,7 +213,8 @@ namespace CrashHandler
+     // record/context from the current call site so the same pipeline produces a
+     // full .log and .dmp captured at the point the process is dying.
+     // -------------------------------------------------------------------------
+-    static void ReportSynthetic(DWORD code, PEXCEPTION_RECORD rec, PCONTEXT ctx)
++    static void ReportSynthetic(DWORD code, PEXCEPTION_RECORD rec, PCONTEXT ctx,
++                                bool hasDetail = false, ULONG_PTR detail = 0)
+     {
+         CONTEXT          localCtx{};
+         EXCEPTION_RECORD localRec{};
+@@ -207,6 +227,10 @@ namespace CrashHandler
+             localRec.ExceptionCode    = code;
+             localRec.ExceptionFlags   = EXCEPTION_NONCONTINUABLE;
+             localRec.ExceptionAddress = reinterpret_cast<PVOID>(ctx->Rip);
++            if (hasDetail) {
++                localRec.NumberParameters = 1;
++                localRec.ExceptionInformation[0] = detail;
++            }
+             rec = &localRec;
+         }
+ 
+@@ -244,16 +268,23 @@ namespace CrashHandler
+             // A code of 0 is a normal fast-exit (skip destructors); only capture a
+             // full report for abnormal (non-zero) self-termination.
+             if (code != 0)
+-                ReportSynthetic(0xE0000001 /*synthetic: self-terminate*/, nullptr, nullptr);
++                ReportSynthetic(kSyntheticSelfTerminate, nullptr, nullptr, true, code);
++            else
++                SessionRecovery::MarkCleanExit();
+         }
+         return s_realTerminateProcess ? s_realTerminateProcess(hProcess, code) : FALSE;
+     }
+ 
+     static void WINAPI StubExitProcess(UINT code)
+     {
+-        // Clean-exit path — a breadcrumb only, no crash report (avoids false
+-        // positives when the player simply quits the game).
+         Breadcrumbs::Log("ExitProcess(code=0x%X)", code);
++        if (code == 0) {
++            SessionRecovery::MarkCleanExit();
++        } else {
++            // A non-zero ExitProcess is frequently the final leg of an assertion or
++            // runtime failure and otherwise leaves no exception context at all.
++            ReportSynthetic(kSyntheticExitNonZero, nullptr, nullptr, true, code);
++        }
+         if (s_realExitProcess)
+             s_realExitProcess(code);   // never returns
+     }
+@@ -262,12 +293,36 @@ namespace CrashHandler
+     static void OnTerminate()
+     {
+         Breadcrumbs::Log("std::terminate — unhandled C++ exception / noexcept violation");
+-        ReportSynthetic(0xE0000002 /*synthetic: std::terminate*/, nullptr, nullptr);
++        ReportSynthetic(kSyntheticTerminate, nullptr, nullptr);
+         if (s_prevTerminate)
+             s_prevTerminate();
+         std::abort();
+     }
+ 
++    // Imported C-runtime fatal paths used by native plugins. Our own static CRT is
++    // deliberately not IAT-patched, so forwarding through these pointers cannot
++    // recurse back into the stubs.
++    static void __cdecl StubAbort()
++    {
++        Breadcrumbs::Log("abort() — C runtime fatal termination");
++        ReportSynthetic(kSyntheticAbort, nullptr, nullptr);
++        if (s_realAbort)
++            s_realAbort();
++        if (s_realTerminateProcess)
++            s_realTerminateProcess(GetCurrentProcess(), kSyntheticAbort);
++    }
++
++    static int __cdecl StubPurecall()
++    {
++        Breadcrumbs::Log("_purecall() — pure virtual function call");
++        ReportSynthetic(kSyntheticPurecall, nullptr, nullptr);
++        if (s_realPurecall)
++            return s_realPurecall();
++        if (s_realTerminateProcess)
++            s_realTerminateProcess(GetCurrentProcess(), kSyntheticPurecall);
++        return 0;
++    }
++
+     // -------------------------------------------------------------------------
+     // Primary handler — registered via SetUnhandledExceptionFilter.
+     // Only called for genuinely unhandled exceptions (safe from false positives).
+@@ -370,41 +425,69 @@ namespace CrashHandler
+     struct IATHook {
+         const char* name;
+         void*       stub;
+-        void*       real[2];   // as exported by kernel32 and by kernelbase
++        void*       real[4];   // one function can be exported by several runtime DLLs
+     };
+ 
+-    enum : std::size_t { kHookSetFilter, kHookFailFast, kHookTerminate, kHookExit };
++    enum : std::size_t {
++        kHookSetFilter, kHookFailFast, kHookTerminate, kHookExit, kHookAbort, kHookPurecall
++    };
+ 
+     static IATHook s_iatHooks[] = {
+         { "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&StubSetUnhandledExceptionFilter), {} },
+         { "RaiseFailFastException",      reinterpret_cast<void*>(&StubRaiseFailFastException),      {} },
+         { "TerminateProcess",            reinterpret_cast<void*>(&StubTerminateProcess),            {} },
+         { "ExitProcess",                 reinterpret_cast<void*>(&StubExitProcess),                 {} },
++        { "abort",                       reinterpret_cast<void*>(&StubAbort),                       {} },
++        { "_purecall",                   reinterpret_cast<void*>(&StubPurecall),                    {} },
+     };
+ 
+     static void ResolveRealImports()
+     {
+         HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+         HMODULE kb  = GetModuleHandleW(L"kernelbase.dll");
++        HMODULE ucrt    = GetModuleHandleW(L"ucrtbase.dll");
++        HMODULE msvcrt  = GetModuleHandleW(L"msvcrt.dll");
++        HMODULE vcr140  = GetModuleHandleW(L"vcruntime140.dll");
++        HMODULE vcr1401 = GetModuleHandleW(L"vcruntime140_1.dll");
+ 
+         s_systemModules[0] = k32;
+         s_systemModules[1] = kb;
+         s_systemModules[2] = GetModuleHandleW(L"ntdll.dll");
+ 
+-        for (auto& hook : s_iatHooks) {
+-            hook.real[0] = k32 ? reinterpret_cast<void*>(GetProcAddress(k32, hook.name)) : nullptr;
+-            hook.real[1] = kb ? reinterpret_cast<void*>(GetProcAddress(kb, hook.name)) : nullptr;
+-            if (hook.real[1] == hook.real[0])
+-                hook.real[1] = nullptr;   // kernel32 forwards to kernelbase; one address
+-        }
++        auto addReal = [](IATHook& hook, HMODULE module) {
++            if (!module) return;
++            void* p = reinterpret_cast<void*>(GetProcAddress(module, hook.name));
++            if (!p) return;
++            for (void*& existing : hook.real) {
++                if (existing == p) return;
++                if (!existing) { existing = p; return; }
++            }
++        };
+ 
+-        // Prefer the kernel32 resolution, falling back to kernelbase.
+-        auto pick = [](const IATHook& h) { return h.real[0] ? h.real[0] : h.real[1]; };
++        // Win32 termination APIs live in kernel32/kernelbase; CRT fatal APIs live
++        // in ucrtbase or the legacy msvcrt on Wine/older plugin builds.
++        for (std::size_t i = kHookSetFilter; i <= kHookExit; ++i) {
++            addReal(s_iatHooks[i], k32);
++            addReal(s_iatHooks[i], kb);
++        }
++        addReal(s_iatHooks[kHookAbort], ucrt);
++        addReal(s_iatHooks[kHookAbort], msvcrt);
++        addReal(s_iatHooks[kHookPurecall], ucrt);
++        addReal(s_iatHooks[kHookPurecall], msvcrt);
++        addReal(s_iatHooks[kHookPurecall], vcr140);
++        addReal(s_iatHooks[kHookPurecall], vcr1401);
++
++        auto pick = [](const IATHook& h) {
++            for (void* p : h.real) if (p) return p;
++            return static_cast<void*>(nullptr);
++        };
+ 
+         s_realSetFilter        = reinterpret_cast<SetUnhandledExceptionFilter_t>(pick(s_iatHooks[kHookSetFilter]));
+         s_realRaiseFailFast    = reinterpret_cast<RaiseFailFastException_t>(pick(s_iatHooks[kHookFailFast]));
+         s_realTerminateProcess = reinterpret_cast<TerminateProcess_t>(pick(s_iatHooks[kHookTerminate]));
+         s_realExitProcess      = reinterpret_cast<ExitProcess_t>(pick(s_iatHooks[kHookExit]));
++        s_realAbort            = reinterpret_cast<Abort_t>(pick(s_iatHooks[kHookAbort]));
++        s_realPurecall         = reinterpret_cast<Purecall_t>(pick(s_iatHooks[kHookPurecall]));
+     }
+ 
+     // -------------------------------------------------------------------------
+@@ -454,7 +537,10 @@ namespace CrashHandler
+                     auto* target = reinterpret_cast<void*>(thunk->u1.Function);
+ 
+                     for (const auto& hook : s_iatHooks) {
+-                        if (target != hook.real[0] && target != hook.real[1])
++                        bool matches = false;
++                        for (void* real : hook.real)
++                            matches = matches || (real && target == real);
++                        if (!matches)
+                             continue;
+ 
+                         DWORD oldProtect = 0;
+@@ -594,11 +680,15 @@ namespace CrashHandler
+         Breadcrumbs::Log("crash handler installed (dll-load notification %s)",
+             notify ? "active" : "unavailable — falling back to post-load rescan");
+ 
+-        REX::INFO("CrashHandler installed (SEH filter + VEH filter guard + termination/fail-fast IAT hooks).");
++        REX::INFO("CrashHandler installed (SEH/VEH + fail-fast/exit/abort/purecall IAT hooks).");
+     }
+ 
+     void OnPostLoad()
+     {
++        // Runtime DLLs used by late-loading native plugins may not have existed at
++        // preload. Refresh their real export addresses before the final IAT pass.
++        ResolveRealImports();
++
+         // Catches anything the loader notification missed — and everything, if it
+         // could not be registered at all. Both passes are idempotent.
+         PatchAllModules();
+diff --git a/src/HangDetector.cpp b/src/HangDetector.cpp
+index ef4f6a3..51759ff 100644
+--- a/src/HangDetector.cpp
++++ b/src/HangDetector.cpp
+@@ -5,8 +5,10 @@
+ #include "LoadOrder.h"
+ #include "LogWriter.h"
+ #include "Modules.h"
++#include "ResourceMonitor.h"
+ #include "StackWalker.h"
+ #include "ThreadInfo.h"
++#include "ThreadSnapshot.h"
+ 
+ namespace HangDetector
+ {
+@@ -252,6 +254,15 @@ namespace HangDetector
+             }
+         }
+ 
++        std::string RawModuleOffset(std::uint64_t address, const std::vector<ModuleInfo>& modules)
++        {
++            const auto* m = Modules::FindModule(address, modules);
++            if (!m)
++                return {};
++            return std::format("{}+0x{:X}{}", m->name, address - m->base,
++                m->isModPlugin ? std::format(" [{}]", m->kind) : "");
++        }
++
+         // ---- the report ------------------------------------------------------
+         void WriteHangReport(const std::vector<std::vector<StackFrame>>& samples,
+                              DWORD tid, int unresponsiveSecs, const char* why)
+@@ -265,7 +276,8 @@ namespace HangDetector
+             if (!out)
+                 return;
+ 
+-            const auto modules = Modules::GetAll();
++            const auto modules      = Modules::GetAll();
++            const auto otherThreads = ThreadSnapshot::Capture(tid, 32, 16);
+ 
+             out << "Cyberpunk 2077 Crash Logger — HANG REPORT\n";
+             // localtime_s, not chrono::current_zone(): the latter needs the timezone
+@@ -329,6 +341,31 @@ namespace HangDetector
+                 out << "\n";
+             }
+ 
++            out << std::format("OTHER THREADS AT HANG ({} captured of {} candidates{})\n",
++                otherThreads.threads.size(), otherThreads.candidates,
++                otherThreads.truncated ? ", truncated" : "");
++            if (otherThreads.failed)
++                out << std::format("  {} thread(s) could not be sampled.\n", otherThreads.failed);
++            for (const auto& t : otherThreads.threads) {
++                bool modTouched = false;
++                for (auto addr : t.addresses) {
++                    const auto* m = Modules::FindModule(addr, modules);
++                    if (m && m->isModPlugin) { modTouched = true; break; }
++                }
++                out << std::format("  THREAD {}{}\n", t.description, modTouched ? "  [MOD DLL ON STACK]" : "");
++                for (std::size_t f = 0; f < t.addresses.size(); ++f) {
++                    const auto addr = t.addresses[f];
++                    out << std::format("    [{:>2}] 0x{:016X}", f, addr);
++                    if (auto where = RawModuleOffset(addr, modules); !where.empty())
++                        out << std::format("  {}", where);
++                    out << "\n";
++                }
++            }
++            if (otherThreads.threads.empty())
++                out << "  (none captured)\n";
++            out << "\n";
++
++            out << "RESOURCE HISTORY\n" << ResourceMonitor::Report() << "\n";
+             out << "MODDING STACK\n" << Frameworks::Report() << "\n";
+ 
+             out << "RECENT BREADCRUMBS\n";
+diff --git a/src/LogWriter.cpp b/src/LogWriter.cpp
+index 6185d88..ad73913 100644
+--- a/src/LogWriter.cpp
++++ b/src/LogWriter.cpp
+@@ -5,8 +5,10 @@
+ #include "CrashSignature.h"
+ #include "Frameworks.h"
+ #include "LoadOrder.h"
++#include "ResourceMonitor.h"
+ #include "SystemInfo.h"
+ #include "ThreadInfo.h"
++#include "ThreadSnapshot.h"
+ 
+ namespace LogWriter
+ {
+@@ -33,10 +35,49 @@ namespace LogWriter
+         case EXCEPTION_PRIV_INSTRUCTION:         return "PRIV_INSTRUCTION";
+         case EXCEPTION_SINGLE_STEP:              return "SINGLE_STEP";
+         case EXCEPTION_STACK_OVERFLOW:           return "STACK_OVERFLOW";
++        case 0xC0000017:                         return "NO_MEMORY";
++        case 0xC000009A:                         return "INSUFFICIENT_RESOURCES";
++        case 0xC0000374:                         return "HEAP_CORRUPTION";
++        case 0xC0000409:                         return "STACK_BUFFER_OVERRUN / FAIL_FAST";
++        case 0xC000041D:                         return "FATAL_USER_CALLBACK";
++        case 0xC0000602:                         return "FAIL_FAST_EXCEPTION";
++        case 0xE0000001:                         return "SELF_TERMINATE";
++        case 0xE0000002:                         return "STD_TERMINATE";
++        case 0xE0000003:                         return "CRT_ABORT";
++        case 0xE0000004:                         return "PURE_VIRTUAL_CALL";
++        case 0xE0000005:                         return "EXITPROCESS_NONZERO";
++        case 0xE06D7363:                         return "MSVC_CPP_EXCEPTION";
+         default:                                 return std::format("0x{:08X}", code);
+         }
+     }
+ 
++    static std::string DiagnosticHint(const EXCEPTION_RECORD* rec)
++    {
++        switch (rec->ExceptionCode) {
++        case EXCEPTION_STACK_OVERFLOW:
++            return "  Class:   stack exhaustion / runaway recursion. The report was moved to the reserve reporter thread.\n";
++        case 0xC0000017:
++        case 0xC000009A:
++            return "  Class:   memory/resource exhaustion. Check RESOURCE HISTORY below, especially commit free/peak private bytes.\n";
++        case 0xC0000374:
++            return "  Class:   heap corruption detected by the allocator. The instruction that trips it can be later than the write that damaged the heap.\n";
++        case 0xC0000409:
++            return "  Class:   fail-fast / stack-cookie or runtime integrity failure. This path can bypass normal SEH on Wine.\n";
++        case 0xE0000003:
++            return "  Class:   native C runtime abort() was invoked by the game or a DLL.\n";
++        case 0xE0000004:
++            return "  Class:   pure virtual function call (_purecall), commonly a destroyed/partially-constructed C++ object.\n";
++        case 0xE0000002:
++            return "  Class:   std::terminate (unhandled C++ exception or noexcept violation).\n";
++        case 0xE0000001:
++            return "  Class:   self TerminateProcess with a non-zero code. The original exit code is preserved in CrashLogger_trace.log.\n";
++        case 0xE0000005:
++            return "  Class:   ExitProcess with a non-zero status, often the final step of an assertion/runtime fatal path.\n";
++        default:
++            return {};
++        }
++    }
++
+     // Well-known debug-allocator fill patterns. A value that is one of these
+     // (optionally plus a small field offset, from dereferencing a poison pointer)
+     // pins the bug class instantly — no debugger needed.
+@@ -386,6 +427,11 @@ namespace LogWriter
+         const std::vector<ModuleInfo>&   modules,
+         const std::string&               fileTimestamp)
+     {
++        // Capture other threads before report formatting. The capture resumes each
++        // victim before allocating or resolving anything, so it cannot strand a
++        // lock-owning thread in Suspended state.
++        const auto otherThreads = ThreadSnapshot::Capture(crash.threadId, 48, 24);
++
+         const auto logDir = GetLogDir();
+         std::filesystem::create_directories(logDir);
+ 
+@@ -429,6 +475,11 @@ namespace LogWriter
+         out << IdSuffix(excAddr) << "\n";
+         // The same fault means different things on the main thread and on a worker.
+         out << std::format("  Thread:  {}\n", ThreadInfo::Describe(crash.threadId));
++        if ((rec->ExceptionCode == 0xE0000001 || rec->ExceptionCode == 0xE0000005) &&
++            rec->NumberParameters >= 1)
++            out << std::format("  Exit code: 0x{:08X} ({})\n",
++                static_cast<std::uint32_t>(rec->ExceptionInformation[0]),
++                static_cast<std::uint32_t>(rec->ExceptionInformation[0]));
+ 
+         if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+             rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) {
+@@ -436,6 +487,7 @@ namespace LogWriter
+             out << FaultAnalysis(rec, ctx);
+             out << FaultRegion(rec, crash);
+         }
++        out << DiagnosticHint(rec);
+         out << "\n";
+ 
+         // ------------------------------------------------------------------ analysis
+@@ -501,6 +553,8 @@ namespace LogWriter
+         out << std::format("  Memory:   {}\n", SystemInfo::SystemMemory());
+         out << std::format("  Process:  {}\n", SystemInfo::ProcessMemory());
+         out << "\n";
++        out << "RESOURCE HISTORY (5-second watchdog; useful when the fault is OOM/commit/handle pressure)\n";
++        out << ResourceMonitor::Report() << "\n";
+ 
+         // ------------------------------------------------------------------ breadcrumbs
+         // The most recent early-warning trace lines (first-chance exceptions and
+@@ -581,6 +635,34 @@ namespace LogWriter
+         }
+         out << "\n";
+ 
++        // ------------------------------------------------------------------ other threads
++        out << std::format("OTHER THREADS ({} captured of {} candidates{}; raw unwind, no dbghelp while suspended)\n",
++            otherThreads.threads.size(), otherThreads.candidates,
++            otherThreads.truncated ? ", truncated" : "");
++        if (otherThreads.failed)
++            out << std::format("  {} thread(s) could not be opened/suspended/unwound.\n", otherThreads.failed);
++        if (otherThreads.threads.empty()) {
++            out << "  (none captured)\n";
++        } else {
++            for (const auto& t : otherThreads.threads) {
++                bool modTouched = false;
++                for (auto addr : t.addresses) {
++                    const auto* m = Modules::FindModule(addr, modules);
++                    if (m && m->isModPlugin) { modTouched = true; break; }
++                }
++                out << std::format("  THREAD {}{}\n", t.description, modTouched ? "  [MOD DLL ON STACK]" : "");
++                for (std::size_t i = 0; i < t.addresses.size(); ++i) {
++                    const auto addr = t.addresses[i];
++                    const auto where = ModuleOffset(addr, modules);
++                    out << std::format("    [{:>2}] 0x{:016X}", i, addr);
++                    if (!where.empty())
++                        out << std::format("  {}", where);
++                    out << IdSuffix(addr) << "\n";
++                }
++            }
++        }
++        out << "\n";
++
+         // ------------------------------------------------------------------ stack scan
+         // Every value on the raw stack that resolves to a module (return address)
+         // or a live RTTI object. Recovers the deeper frames the strict unwinder
+diff --git a/src/Main.cpp b/src/Main.cpp
+index 826210b..f0e1d97 100644
+--- a/src/Main.cpp
++++ b/src/Main.cpp
+@@ -5,6 +5,8 @@
+ #include "Frameworks.h"
+ #include "HangDetector.h"
+ #include "LoadOrder.h"
++#include "ResourceMonitor.h"
++#include "SessionRecovery.h"
+ #include "LogWriter.h"
+ #include "SystemInfo.h"
+ #include "ThreadInfo.h"
+@@ -45,7 +47,9 @@ namespace
+         // It is a directory walk over ~1300 entries reading no file contents, on a
+         // background thread — cheap enough not to disturb the load it overlaps.
+         try {
++            SessionRecovery::Init(); // stale session marker + native REDEngine ReportQueue recovery
+             SystemInfo::Init();       // OS/CPU/GPU/Wine (memory is sampled at crash time)
++            ResourceMonitor::Start(); // pressure history survives OOM/resource-exhaustion crashes
+             AddressLibrary::Init();   // inert on CP2077 for now; records why
+             LoadOrder::Init();        // .archive / .xl / tweaks / input / CET / redscript
+             Frameworks::Init();       // modding-stack health: did redscript compile?
+@@ -73,8 +77,13 @@ namespace
+     }
+ }
+ 
+-BOOL APIENTRY DllMain(HMODULE a_module, DWORD a_reason, LPVOID)
++BOOL APIENTRY DllMain(HMODULE a_module, DWORD a_reason, LPVOID a_reserved)
+ {
++    if (a_reason == DLL_PROCESS_DETACH) {
++        if (a_reserved)
++            SessionRecovery::OnProcessDetach();
++        return TRUE;
++    }
+     if (a_reason != DLL_PROCESS_ATTACH)
+         return TRUE;
+ 
+diff --git a/b/src/ResourceMonitor.cpp b/src/ResourceMonitor.cpp
+new file mode 100644
+index 0000000..0c1efac
+--- /dev/null
++++ b/src/ResourceMonitor.cpp
+@@ -0,0 +1,184 @@
++#include "PCH.h"
++#include "ResourceMonitor.h"
++#include "Breadcrumbs.h"
++#include "LogWriter.h"
++
++namespace ResourceMonitor
++{
++    namespace
++    {
++        constexpr DWORD         kSampleMs        = 5000;
++        constexpr std::uint64_t kGiB             = 1024ull * 1024ull * 1024ull;
++        constexpr std::uint64_t kLowDiskBytes    = 2ull * kGiB;
++        constexpr DWORD         kHighHandleCount = 20000;
++        constexpr std::uint64_t kNoMinimum       = ~std::uint64_t{0};
++
++        std::atomic_bool          s_started{ false };
++        std::atomic<std::uint64_t> s_physAvail{ 0 }, s_physTotal{ 0 };
++        std::atomic<std::uint64_t> s_commitAvail{ 0 }, s_commitLimit{ 0 };
++        std::atomic<std::uint64_t> s_privateBytes{ 0 }, s_workingSet{ 0 };
++        std::atomic<std::uint64_t> s_peakPrivate{ 0 };
++        std::atomic<std::uint64_t> s_minPhysAvail{ kNoMinimum }, s_minCommitAvail{ kNoMinimum };
++        std::atomic<std::uint64_t> s_diskFree{ 0 };
++        std::atomic<DWORD>         s_handles{ 0 }, s_peakHandles{ 0 };
++        std::atomic<std::uint64_t> s_samples{ 0 };
++
++        std::atomic<int>  s_commitWarnLevel{ 0 };
++        std::atomic_bool  s_physWarned{ false };
++        std::atomic_bool  s_handleWarned{ false };
++        std::atomic_bool  s_diskWarned{ false };
++
++        void AtomicMax(std::atomic<std::uint64_t>& target, std::uint64_t value)
++        {
++            auto cur = target.load(std::memory_order_relaxed);
++            while (value > cur && !target.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {}
++        }
++
++        void AtomicMin(std::atomic<std::uint64_t>& target, std::uint64_t value)
++        {
++            auto cur = target.load(std::memory_order_relaxed);
++            while (value < cur && !target.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {}
++        }
++
++        void AtomicMax(std::atomic<DWORD>& target, DWORD value)
++        {
++            auto cur = target.load(std::memory_order_relaxed);
++            while (value > cur && !target.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {}
++        }
++
++        unsigned Percent(std::uint64_t used, std::uint64_t total)
++        {
++            return total ? static_cast<unsigned>((used * 100 + total / 2) / total) : 0;
++        }
++
++        std::string Bytes(std::uint64_t bytes)
++        {
++            constexpr double MiB = 1024.0 * 1024.0;
++            constexpr double GiB = MiB * 1024.0;
++            if (bytes >= kGiB)
++                return std::format("{:.1f} GiB", static_cast<double>(bytes) / GiB);
++            return std::format("{:.1f} MiB", static_cast<double>(bytes) / MiB);
++        }
++
++        void Sample()
++        {
++            MEMORYSTATUSEX ms{};
++            ms.dwLength = sizeof(ms);
++            if (GlobalMemoryStatusEx(&ms)) {
++                const auto commitAvail = ms.ullAvailPageFile;
++                s_physAvail.store(ms.ullAvailPhys, std::memory_order_relaxed);
++                s_physTotal.store(ms.ullTotalPhys, std::memory_order_relaxed);
++                s_commitAvail.store(commitAvail, std::memory_order_relaxed);
++                s_commitLimit.store(ms.ullTotalPageFile, std::memory_order_relaxed);
++                AtomicMin(s_minPhysAvail, ms.ullAvailPhys);
++                AtomicMin(s_minCommitAvail, commitAvail);
++
++                const auto commitUsed = ms.ullTotalPageFile - commitAvail;
++                const auto commitPct  = Percent(commitUsed, ms.ullTotalPageFile);
++                const int level       = commitPct >= 97 ? 2 : commitPct >= 90 ? 1 : 0;
++                int old = s_commitWarnLevel.load(std::memory_order_relaxed);
++                if (level > old && s_commitWarnLevel.compare_exchange_strong(old, level)) {
++                    Breadcrumbs::Log("RESOURCE %s: system commit %u%% used, %llu MiB available",
++                        level == 2 ? "CRITICAL" : "warning", commitPct,
++                        static_cast<unsigned long long>(commitAvail / (1024ull * 1024ull)));
++                }
++
++                const bool lowPhys = ms.ullAvailPhys < kGiB ||
++                    (ms.ullTotalPhys && ms.ullAvailPhys * 20 < ms.ullTotalPhys); // under 5%
++                if (lowPhys && !s_physWarned.exchange(true))
++                    Breadcrumbs::Log("RESOURCE warning: low physical memory, %llu MiB available",
++                        static_cast<unsigned long long>(ms.ullAvailPhys / (1024ull * 1024ull)));
++            }
++
++            PROCESS_MEMORY_COUNTERS_EX pmc{};
++            pmc.cb = sizeof(pmc);
++            if (GetProcessMemoryInfo(GetCurrentProcess(),
++                    reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
++                const std::uint64_t priv = pmc.PrivateUsage ? pmc.PrivateUsage : pmc.PagefileUsage;
++                s_privateBytes.store(priv, std::memory_order_relaxed);
++                s_workingSet.store(pmc.WorkingSetSize, std::memory_order_relaxed);
++                AtomicMax(s_peakPrivate, priv);
++            }
++
++            DWORD handles = 0;
++            if (GetProcessHandleCount(GetCurrentProcess(), &handles)) {
++                s_handles.store(handles, std::memory_order_relaxed);
++                AtomicMax(s_peakHandles, handles);
++                if (handles >= kHighHandleCount && !s_handleWarned.exchange(true))
++                    Breadcrumbs::Log("RESOURCE warning: unusually high handle count: %lu",
++                        static_cast<unsigned long>(handles));
++            }
++
++            ULARGE_INTEGER freeBytes{};
++            const auto dir = LogWriter::GetLogDir();
++            if (!dir.empty() && GetDiskFreeSpaceExW(dir.root_path().wstring().c_str(),
++                    &freeBytes, nullptr, nullptr)) {
++                s_diskFree.store(freeBytes.QuadPart, std::memory_order_relaxed);
++                if (freeBytes.QuadPart < kLowDiskBytes && !s_diskWarned.exchange(true))
++                    Breadcrumbs::Log("RESOURCE warning: low free disk space on crash-log volume: %llu MiB",
++                        static_cast<unsigned long long>(freeBytes.QuadPart / (1024ull * 1024ull)));
++            }
++
++            s_samples.fetch_add(1, std::memory_order_relaxed);
++        }
++
++        DWORD WINAPI MonitorThread(LPVOID)
++        {
++            for (;;) {
++                Sample();
++                Sleep(kSampleMs);
++            }
++        }
++    }
++
++    void Start()
++    {
++        if (s_started.exchange(true))
++            return;
++
++        Sample();
++        if (HANDLE h = CreateThread(nullptr, 0, MonitorThread, nullptr, 0, nullptr)) {
++            CloseHandle(h);
++            REX::INFO("ResourceMonitor: sampling every {} ms.", kSampleMs);
++        } else {
++            REX::WARN("ResourceMonitor: watchdog thread could not be created; one startup sample retained.");
++        }
++    }
++
++    std::string Report()
++    {
++        const auto samples = s_samples.load(std::memory_order_relaxed);
++        if (!samples)
++            return "  (resource watchdog not started)\n";
++
++        const auto physAvail   = s_physAvail.load(std::memory_order_relaxed);
++        const auto physTotal   = s_physTotal.load(std::memory_order_relaxed);
++        const auto commitAvail = s_commitAvail.load(std::memory_order_relaxed);
++        const auto commitLimit = s_commitLimit.load(std::memory_order_relaxed);
++        const auto privateNow  = s_privateBytes.load(std::memory_order_relaxed);
++        const auto workingSet  = s_workingSet.load(std::memory_order_relaxed);
++        const auto peakPrivate = s_peakPrivate.load(std::memory_order_relaxed);
++        auto minPhys           = s_minPhysAvail.load(std::memory_order_relaxed);
++        auto minCommit         = s_minCommitAvail.load(std::memory_order_relaxed);
++        const auto diskFree    = s_diskFree.load(std::memory_order_relaxed);
++        const auto handles     = s_handles.load(std::memory_order_relaxed);
++        const auto peakHandles = s_peakHandles.load(std::memory_order_relaxed);
++
++        if (minPhys == kNoMinimum) minPhys = 0;
++        if (minCommit == kNoMinimum) minCommit = 0;
++
++        const auto commitUsed = commitLimit > commitAvail ? commitLimit - commitAvail : 0;
++        std::string out;
++        out += std::format("  samples: {} (5s cadence)\n", samples);
++        out += std::format("  RAM now: {} free / {} total; minimum observed free: {}\n",
++            Bytes(physAvail), Bytes(physTotal), Bytes(minPhys));
++        out += std::format("  Commit:  {} used / {} limit ({}%); minimum observed free: {}\n",
++            Bytes(commitUsed), Bytes(commitLimit), Percent(commitUsed, commitLimit), Bytes(minCommit));
++        out += std::format("  Process: private {} now / {} peak; working set {}\n",
++            Bytes(privateNow), Bytes(peakPrivate), Bytes(workingSet));
++        out += std::format("  Handles: {} now / {} peak\n", handles, peakHandles);
++        if (diskFree)
++            out += std::format("  Crash-log volume free: {}\n", Bytes(diskFree));
++        return out;
++    }
++}
+diff --git a/b/src/SessionRecovery.cpp b/src/SessionRecovery.cpp
+new file mode 100644
+index 0000000..9c66e9e
+--- /dev/null
++++ b/src/SessionRecovery.cpp
+@@ -0,0 +1,276 @@
++#include "PCH.h"
++#include "SessionRecovery.h"
++#include "LogWriter.h"
++
++#include <cctype>
++#include <cstdlib>
++
++namespace SessionRecovery
++{
++    namespace
++    {
++        constexpr std::uint64_t kTicksPerSecond = 10'000'000ull;
++        constexpr std::uint64_t kCorrelationSlack = 120ull * kTicksPerSecond;
++        constexpr std::uintmax_t kTextCap = 256 * 1024;
++
++        std::filesystem::path s_currentMarker;
++        std::atomic_bool       s_abnormal{ false };
++
++        std::uint64_t FileTimeNow()
++        {
++            FILETIME ft{};
++            GetSystemTimeAsFileTime(&ft);
++            ULARGE_INTEGER u{};
++            u.LowPart = ft.dwLowDateTime;
++            u.HighPart = ft.dwHighDateTime;
++            return u.QuadPart;
++        }
++
++        std::uint64_t PathWriteTime(const std::filesystem::path& p)
++        {
++            WIN32_FILE_ATTRIBUTE_DATA data{};
++            if (!GetFileAttributesExW(p.wstring().c_str(), GetFileExInfoStandard, &data))
++                return 0;
++            ULARGE_INTEGER u{};
++            u.LowPart = data.ftLastWriteTime.dwLowDateTime;
++            u.HighPart = data.ftLastWriteTime.dwHighDateTime;
++            return u.QuadPart;
++        }
++
++        bool ProcessAlive(DWORD pid)
++        {
++            // Init() runs before this process creates its own marker, so a marker
++            // carrying our freshly-reused PID is necessarily stale.
++            if (!pid || pid == GetCurrentProcessId())
++                return false;
++            HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
++            if (!h)
++                return false;
++            const bool alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
++            CloseHandle(h);
++            return alive;
++        }
++
++        struct Marker
++        {
++            DWORD         pid{};
++            std::uint64_t started{};
++            std::string   display;
++        };
++
++        Marker ReadMarker(const std::filesystem::path& p)
++        {
++            Marker m;
++            std::ifstream in(p);
++            std::string line;
++            while (std::getline(in, line)) {
++                if (line.starts_with("pid="))
++                    m.pid = static_cast<DWORD>(std::strtoul(line.c_str() + 4, nullptr, 10));
++                else if (line.starts_with("started_filetime="))
++                    m.started = std::strtoull(line.c_str() + 17, nullptr, 10);
++                else if (line.starts_with("started_display="))
++                    m.display = line.substr(16);
++            }
++            return m;
++        }
++
++        std::filesystem::path ReportQueue()
++        {
++            wchar_t buf[32768]{};
++            const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, static_cast<DWORD>(std::size(buf)));
++            if (!n || n >= std::size(buf))
++                return {};
++            return std::filesystem::path(buf) / "REDEngine" / "ReportQueue";
++        }
++
++        std::filesystem::path NewestReportFolder(std::uint64_t after)
++        {
++            const auto root = ReportQueue();
++            std::error_code ec;
++            if (root.empty() || !std::filesystem::is_directory(root, ec))
++                return {};
++
++            std::filesystem::path best;
++            std::uint64_t bestTime = 0;
++            for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
++                if (!e.is_directory(ec))
++                    continue;
++                const auto t = PathWriteTime(e.path());
++                if (t >= after && t > bestTime) {
++                    best = e.path();
++                    bestTime = t;
++                }
++            }
++            return best;
++        }
++
++        std::string ReadTextCapped(const std::filesystem::path& p)
++        {
++            std::ifstream in(p, std::ios::binary);
++            if (!in)
++                return {};
++            std::string s;
++            s.resize(static_cast<std::size_t>((std::min<std::uintmax_t>)(
++                std::filesystem::file_size(p), kTextCap)));
++            in.read(s.data(), static_cast<std::streamsize>(s.size()));
++            s.resize(static_cast<std::size_t>(in.gcount()));
++            if (in.peek() != EOF)
++                s += "\n... [truncated by CrashLogger] ...\n";
++            return s;
++        }
++
++        std::filesystem::path FindCaseInsensitive(const std::filesystem::path& dir, std::string wanted)
++        {
++            std::transform(wanted.begin(), wanted.end(), wanted.begin(),
++                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++            std::error_code ec;
++            for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
++                if (!e.is_regular_file(ec))
++                    continue;
++                auto n = e.path().filename().string();
++                std::transform(n.begin(), n.end(), n.begin(),
++                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++                if (n == wanted)
++                    return e.path();
++            }
++            return {};
++        }
++
++        void WritePostmortem(const std::filesystem::path& markerPath, const Marker& marker)
++        {
++            const auto outPath = LogWriter::GetLogDir() /
++                std::format("postmortem_{}_pid{}.log", LogWriter::MakeFileTimestamp(), marker.pid);
++            std::ofstream out(outPath, std::ios::out | std::ios::trunc);
++            if (!out)
++                return;
++
++            out << "Cyberpunk 2077 Crash Logger — PREVIOUS SESSION POSTMORTEM\n";
++            out << std::format("Previous PID: {}\n", marker.pid);
++            out << std::format("Previous start: {}\n", marker.display.empty() ? "unknown" : marker.display);
++            out << "Detection: the session marker survived but that process is no longer running.\n"
++                   "This means the previous run did not reach a clean ExitProcess/TerminateProcess(0).\n"
++                   "It covers hard kills and crash paths that can bypass an in-process exception handler.\n\n";
++
++            const std::uint64_t after = marker.started > kCorrelationSlack
++                ? marker.started - kCorrelationSlack : 0;
++            const auto reportDir = NewestReportFolder(after);
++            out << "REDENGINE REPORT QUEUE\n";
++            out << std::format("  root: {}\n", ReportQueue().empty() ? "(LOCALAPPDATA unavailable)" : ReportQueue().string());
++
++            if (reportDir.empty()) {
++                out << "  No report folder newer than the previous session start was found.\n"
++                       "  This is consistent with a hard kill, driver/process termination, raw fail-fast,\n"
++                       "  or a crash occurring before REDEngineErrorReporter produced its artifacts.\n\n";
++            } else {
++                out << std::format("  correlated folder: {}\n", reportDir.string());
++                out << "  files:\n";
++                std::error_code ec;
++                for (const auto& e : std::filesystem::directory_iterator(reportDir, ec)) {
++                    if (!e.is_regular_file(ec))
++                        continue;
++                    const auto size = e.file_size(ec);
++                    out << std::format("    - {} ({} bytes)\n", e.path().filename().string(), ec ? 0 : size);
++                }
++                out << "\n";
++
++                const auto stack = FindCaseInsensitive(reportDir, "stacktrace.txt");
++                if (!stack.empty()) {
++                    out << "--- REDEngine stacktrace.txt ---\n";
++                    out << ReadTextCapped(stack) << "\n--- end stacktrace.txt ---\n\n";
++                }
++
++                const auto crashInfo = FindCaseInsensitive(reportDir, "CrashInfo.json");
++                if (!crashInfo.empty()) {
++                    out << "--- REDEngine CrashInfo.json ---\n";
++                    out << ReadTextCapped(crashInfo) << "\n--- end CrashInfo.json ---\n\n";
++                }
++            }
++
++            out << "TRACE POINTER\n"
++                   "  Also inspect CrashLogger_trace.log for the final first-chance exception/resource\n"
++                   "  breadcrumbs from the previous process.\n\n"
++                   "-- end of previous-session postmortem --\n";
++            out.flush();
++
++            std::error_code ec;
++            std::filesystem::remove(markerPath, ec);
++            REX::INFO("SessionRecovery: previous abnormal session -> {}", outPath.string());
++        }
++
++        void CreateCurrentMarker(const std::filesystem::path& sessions)
++        {
++            const DWORD pid = GetCurrentProcessId();
++            s_currentMarker = sessions / std::format("{}.active", pid);
++            std::ofstream out(s_currentMarker, std::ios::out | std::ios::trunc);
++            if (!out) {
++                s_currentMarker.clear();
++                return;
++            }
++            out << "version=1\n";
++            out << std::format("pid={}\n", pid);
++            out << std::format("started_filetime={}\n", FileTimeNow());
++            out << std::format("started_display={}\n", LogWriter::MakeDisplayTimestamp());
++            out.flush();
++        }
++    }
++
++    void Init()
++    {
++        try {
++            const auto sessions = LogWriter::GetLogDir() / "sessions";
++            std::error_code ec;
++            std::filesystem::create_directories(sessions, ec);
++
++            for (const auto& e : std::filesystem::directory_iterator(sessions, ec)) {
++                if (!e.is_regular_file(ec) || e.path().extension() != ".active")
++                    continue;
++                const Marker marker = ReadMarker(e.path());
++                if (!marker.pid || ProcessAlive(marker.pid))
++                    continue;
++                try {
++                    WritePostmortem(e.path(), marker);
++                } catch (const std::exception& ex) {
++                    REX::WARN("SessionRecovery: stale-session analysis failed for {}: {}",
++                        e.path().string(), ex.what());
++                }
++            }
++
++            CreateCurrentMarker(sessions);
++            if (!s_currentMarker.empty())
++                REX::INFO("SessionRecovery: armed {}", s_currentMarker.string());
++        } catch (const std::exception& e) {
++            REX::WARN("SessionRecovery: init failed: {}", e.what());
++        }
++    }
++
++    void MarkAbnormal() noexcept
++    {
++        s_abnormal.store(true, std::memory_order_relaxed);
++    }
++
++    void MarkCleanExit() noexcept
++    {
++        if (s_abnormal.load(std::memory_order_relaxed))
++            return;
++        try {
++            if (s_currentMarker.empty())
++                return;
++            std::error_code ec;
++            std::filesystem::remove(s_currentMarker, ec);
++            s_currentMarker.clear();
++        } catch (...) {
++            // Process is exiting; the marker remaining merely yields a conservative
++            // postmortem on next launch, which is preferable to risking shutdown.
++        }
++    }
++
++    void OnProcessDetach() noexcept
++    {
++        if (s_abnormal.load(std::memory_order_relaxed) || s_currentMarker.empty())
++            return;
++        // Raw Win32 only: DllMain owns the loader lock here. No filesystem traversal,
++        // formatting or allocation. A failed deletion is harmless and will be
++        // reported conservatively as an unclean session next launch.
++        DeleteFileW(s_currentMarker.c_str());
++    }
++}
+diff --git a/src/ThreadInfo.cpp b/src/ThreadInfo.cpp
+index 5d820d5..fa71d19 100644
+--- a/src/ThreadInfo.cpp
++++ b/src/ThreadInfo.cpp
+@@ -88,8 +88,15 @@ namespace ThreadInfo
+         const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+         if (n <= 1)
+             return {};
+-        std::string s(static_cast<std::size_t>(n - 1), '\0');
+-        WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
++        // WideCharToMultiByte includes the trailing NUL in `n`. Reserve an actual
++        // byte for it; writing `n` bytes into an n-1 sized string is undefined
++        // behaviour and became much easier to hit once all-thread snapshots began
++        // describing many threads per report.
++        std::string s(static_cast<std::size_t>(n), '\0');
++        const int written = WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
++        if (written <= 1)
++            return {};
++        s.resize(static_cast<std::size_t>(written - 1));
+         return s;
+     }
+ 
+diff --git a/b/src/ThreadSnapshot.cpp b/src/ThreadSnapshot.cpp
+new file mode 100644
+index 0000000..bcd32ba
+--- /dev/null
++++ b/src/ThreadSnapshot.cpp
+@@ -0,0 +1,84 @@
++#include "PCH.h"
++#include "ThreadSnapshot.h"
++#include "ThreadInfo.h"
++
++#include <TlHelp32.h>
++
++namespace ThreadSnapshot
++{
++    ThreadSnapshotResult Capture(std::uint32_t excludedThreadId,
++                                 std::size_t maxThreads,
++                                 std::size_t maxFrames)
++    {
++        ThreadSnapshotResult result;
++        if (maxThreads == 0 || maxFrames == 0)
++            return result;
++
++        constexpr std::size_t kHardMaxFrames = 64;
++        maxFrames = (std::min)(maxFrames, kHardMaxFrames);
++
++        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++        if (snap == INVALID_HANDLE_VALUE)
++            return result;
++
++        const DWORD pid        = GetCurrentProcessId();
++        const DWORD currentTid = GetCurrentThreadId();
++
++        THREADENTRY32 te{};
++        te.dwSize = sizeof(te);
++        if (!Thread32First(snap, &te)) {
++            CloseHandle(snap);
++            return result;
++        }
++
++        do {
++            if (te.th32OwnerProcessID != pid)
++                continue;
++            if (te.th32ThreadID == excludedThreadId || te.th32ThreadID == currentTid)
++                continue;
++
++            ++result.candidates;
++            if (result.threads.size() >= maxThreads) {
++                result.truncated = true;
++                continue;
++            }
++
++            HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
++                                       THREAD_QUERY_LIMITED_INFORMATION,
++                                       FALSE, te.th32ThreadID);
++            if (!thread) {
++                ++result.failed;
++                continue;
++            }
++
++            std::array<std::uint64_t, kHardMaxFrames> raw{};
++            std::size_t count = 0;
++            bool captured = false;
++
++            if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
++                CONTEXT ctx{};
++                ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++                if (GetThreadContext(thread, &ctx)) {
++                    count = StackWalker::Unwind(&ctx, raw.data(), maxFrames);
++                    captured = count != 0;
++                }
++                ResumeThread(thread); // resume before allocations / strings / logging
++            }
++            CloseHandle(thread);
++
++            if (!captured) {
++                ++result.failed;
++                continue;
++            }
++
++            ThreadStackSnapshot ts;
++            ts.threadId    = te.th32ThreadID;
++            ts.description = ThreadInfo::Describe(te.th32ThreadID);
++            ts.addresses.assign(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(count));
++            result.threads.push_back(std::move(ts));
++        } while (Thread32Next(snap, &te));
++
++        CloseHandle(snap);
++        return result;
++    }
++}
