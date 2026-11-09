@@ -9,7 +9,7 @@
 
 A high-fidelity, self-contained native **ASI crash logger and hang/freeze detector** for **Cyberpunk 2077** (REDengine 4), designed from the ground up for both **Linux / Steam Deck (Proton / Wine)** and **Windows**.
 
-Derived from the lineage of [`sf-crash-logger`](https://github.com/0xra0) and engineered specifically around Cyberpunk 2077's internals, memory layout, and modding ecosystem.
+Derived from the lineage of [`sf-crash-logger`](https://github.com/0xra0/sf-crash-logger) and engineered specifically around Cyberpunk 2077's internals, memory layout, and modding ecosystem.
 
 ---
 
@@ -316,4 +316,4 @@ This project is licensed under the **GNU General Public License v3.0** (GPLv3). 
 ### Disclaimers & Trademarks
 - **Cyberpunk 2077** is a registered trademark of **CD PROJEKT S.A.**
 - This project is an independent open-source tool and is **not affiliated with, endorsed by, or supported by CD PROJEKT RED**.
-- Special thanks to the creators and maintainers of **Ultimate ASI Loader**, **RED4ext**, **Cyber Engine Tweaks**, and the broader Cyberpunk 2077 modding community.
+- Special thanks to the creators and maintainers of [`sf-crash-logger`](https://github.com/0xra0/sf-crash-logger), **Ultimate ASI Loader**, **RED4ext**, **Cyber Engine Tweaks**, and the broader Cyberpunk 2077 modding community.
